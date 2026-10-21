@@ -75,11 +75,46 @@ class RagService:
              "score": round(score, 3), "snippet": chunk.text[:220]}
             for i, (chunk, score) in enumerate(hits, start=1)
         ]
-        if self.llm is None:                          # no API key: still useful, just no generation
+        if self.llm is None:                          # no API key: extract the most specific relevant sentences
             best = hits[0][0]
-            return {"answer": f"(Retrieval-only mode, no Claude key set) Best match from "
-                              f"{best.doc}: {best.text[:400]}",
-                    "sources": sources, "mode": "retrieval-only"}
+            from collections import Counter
+            from .rag import tokenize
+            import re
+            raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", best.text) if s.strip()]
+            q_terms = Counter(tokenize(question))
+            scored_sentences = []
+            for s in raw_sentences:
+                clean_s = re.sub(r"^[#\s\-*]+", "", s).strip()
+                # Skip rhetorical question headings if they end with ?
+                if clean_s.endswith("?") and not clean_s.endswith("? An") and not any(p in clean_s for p in ["must", "approved", "require"]):
+                    continue
+                s_terms = tokenize(clean_s)
+                if not s_terms:
+                    continue
+                # Weight matches by question-term frequency
+                match_score = sum(q_terms[t] for t in s_terms if t in q_terms)
+                # Penalty if asking about annual leave but sentence discusses sick leave (or vice versa)
+                if "annual" in q_terms and "sick" in s_terms:
+                    match_score -= 2
+                if "sick" in q_terms and "annual" in s_terms:
+                    match_score -= 2
+
+                if match_score > 0:
+                    density = match_score / (len(s_terms) ** 0.5)
+                    scored_sentences.append((match_score, density, clean_s))
+
+            scored_sentences.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            if scored_sentences:
+                top_sentences = [s for _, _, s in scored_sentences[:1]]
+                extracted_answer = " ".join(top_sentences)
+            else:
+                extracted_answer = best.text[:300]
+
+            return {
+                "answer": f"From {best.doc}: {extracted_answer}",
+                "sources": sources,
+                "mode": "retrieval-only"
+            }
 
         context = "\n\n".join(f"[{i}] (source: {c.doc})\n{c.text}" for i, (c, _s) in enumerate(hits, start=1))
         prompt = f"Context passages:\n\n{context}\n\nQuestion: {question}"
